@@ -3,7 +3,8 @@
 
 module Network.Wai.Application.Classic.RevProxy (revProxyApp) where
 
-import Blaze.ByteString.Builder (Builder)
+import Blaze.ByteString.Builder (Builder, toLazyByteString)
+import qualified Blaze.ByteString.Builder as BB
 #if __GLASGOW_HASKELL__ < 709
 import Control.Applicative
 #endif
@@ -23,13 +24,31 @@ import Network.Wai.Application.Classic.Header
 import Network.Wai.Application.Classic.Path
 import Network.Wai.Application.Classic.Types
 import Network.Wai.Conduit
+import qualified Network.Wai.Handler.WebSockets as WS
+
+import Data.Monoid ((<>))
+import qualified Network.Wai as WAI
+import qualified Data.Conduit.Network as DCN
+import qualified Data.ByteString.Lazy as L
+import qualified Data.CaseInsensitive as CI
+
+import Control.Concurrent.Async (concurrently)
 
 ----------------------------------------------------------------
 
 -- |  Relaying any requests as reverse proxy.
 
 revProxyApp :: ClassicAppSpec -> RevProxyAppSpec -> RevProxyRoute -> Application
-revProxyApp cspec spec route req respond = H.withResponse httpClientRequest mgr proxy
+revProxyApp cspec spec route req respond
+  | WS.isWebSocketsReq req = revWsProxyApp cspec spec route req respond
+  | otherwise              = revHttpProxyApp cspec spec route req respond
+
+----------------------------------------------------------------
+
+-- |  HTTP
+
+revHttpProxyApp :: ClassicAppSpec -> RevProxyAppSpec -> RevProxyRoute -> Application
+revHttpProxyApp cspec spec route req respond = H.withResponse httpClientRequest mgr proxy
   where
     proxy hrsp = do
         let status     = H.responseStatus hrsp
@@ -116,3 +135,45 @@ badGateway cspec req _ = do
     bdy = byteStringToBuilder "Bad Gateway\r\n"
     st = badGateway502
 -}
+
+----------------------------------------------------------------
+
+revWsProxyApp :: ClassicAppSpec -> RevProxyAppSpec -> RevProxyRoute -> Application
+revWsProxyApp cspec spec route req respond = respond ws
+  where
+    ws = responseRaw relay backup
+    relay fromClientBody toClient = DCN.runTCPClient settings $ \server -> do
+        let toServer = DCN.appSink server
+            fromServer = DCN.appSource server
+            headers = renderHeaders req (WAI.requestHeaders req) -- fixReqHeaders wps req
+            fromClient = do
+                mapM_ yield $ L.toChunks $ toLazyByteString headers
+                let loop = do
+                        bs <- liftIO fromClientBody
+                        unless (BS.null bs) $ do
+                            yield bs
+                            loop
+                loop
+            toClient' = awaitForever $ liftIO . toClient
+        void $ concurrently (fromClient $$ toServer) (fromServer $$ toClient')
+    backup = responseLBS status500 [("Content-Type", "text/plain")]
+        "WebSockets request is detected, but server does not support responseRaw"
+    settings = DCN.clientSettings (revProxyPort route) (revProxyDomain route)
+
+renderHeaders :: WAI.Request -> RequestHeaders -> Builder
+renderHeaders req headers
+    = BB.fromByteString (WAI.requestMethod req)
+   <> BB.fromByteString " "
+   <> BB.fromByteString (WAI.rawPathInfo req)
+   <> BB.fromByteString (WAI.rawQueryString req)
+   <> (if WAI.httpVersion req == http11
+           then BB.fromByteString " HTTP/1.1"
+           else BB.fromByteString " HTTP/1.0")
+   <> mconcat (map goHeader headers)
+   <> BB.fromByteString "\r\n\r\n"
+  where
+    goHeader (x, y)
+        = BB.fromByteString "\r\n"
+       <> BB.fromByteString (CI.original x)
+       <> BB.fromByteString ": "
+       <> BB.fromByteString y

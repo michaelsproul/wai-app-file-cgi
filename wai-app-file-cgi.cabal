@@ -63,7 +63,9 @@ Library
                       , unix
                       , wai >= 3.0 && < 3.1
                       , wai-conduit
+                      , wai-websockets
                       , word8
+                      , async
 
 Test-Suite doctest
   Type:                 exitcode-stdio-1.0
